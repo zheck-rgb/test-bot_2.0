@@ -27,6 +27,18 @@ const { getTriggerReply, getBanatConversationReply } = require("./triggers");
 const { sendBanatReplyWithTyping } = require("./banat-human");
 const { classifyBanatTarget, setBanatConversationMode, isBanatConversationModeActive } = require("./banat-targeting");
 
+// Dashboard password (used if no env var is set on the host).
+// WARNING: anyone who can read this file can control the bot. Keep the repo PRIVATE.
+const DASHBOARD_KEY = "celestial-oFlho12ZwZ2kR8xyOJfe12fb";
+if (!process.env.ECLIPSE_DASHBOARD_API_KEY && !process.env.CELESTIAL_DASHBOARD_API_KEY) {
+  process.env.ECLIPSE_DASHBOARD_API_KEY = DASHBOARD_KEY;
+}
+
+// Railway: if a Volume is attached, keep the cookie there so it survives redeploys.
+if (!process.env.CELESTIAL_SESSION_FILE && process.env.RAILWAY_VOLUME_MOUNT_PATH) {
+  process.env.CELESTIAL_SESSION_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH, "appstate.json");
+}
+
 const PORT = Number(process.env.PORT || 10000);
 const DEFAULT_ON = /^(1|true|yes|on)$/i.test(process.env.BANAT_DEFAULT_ON || "false");
 const GLOBAL_SEND_LIMIT = Math.max(1, Number(process.env.BANAT_GLOBAL_SEND_LIMIT || 2));
@@ -67,6 +79,40 @@ function noteError(where, error) {
   pushEvent("error", `${where}: ${lastError.message}`);
 }
 
+// --- watchdog / auto-recovery state ---
+const MAX_RECONNECTS = Math.max(1, Number(process.env.BANAT_MAX_RECONNECTS || 10));
+const PROBE_INTERVAL_MS = Math.max(60000, Number(process.env.BANAT_PROBE_INTERVAL_MS || 5 * 60 * 1000));
+const MEMORY_LIMIT_MB = Math.max(150, Number(process.env.BANAT_MEMORY_LIMIT_MB || 450));
+const LOGIN_TIMEOUT_MS = 60000;
+const RETRY_AFTER_GIVE_UP_MS = 30 * 60 * 1000;
+let manualStop = false;         // true only when YOU press Disconnect on the dashboard
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let nextRetryAt = null;
+let loginTimer = null;
+let probeFailures = 0;
+let lastProbeAt = null;
+let lastProbeOk = null;
+let offlineSince = Date.now();
+
+// Never let a stray error kill the process.
+process.on("uncaughtException", (error) => {
+  console.error("[BANAT] uncaughtException:", error);
+  noteError("uncaught", error);
+});
+process.on("unhandledRejection", (error) => {
+  console.error("[BANAT] unhandledRejection:", error);
+  noteError("unhandled", error);
+});
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    console.log(`[BANAT] ${sig} received, shutting down`);
+    manualStop = true;
+    try { disconnectBot(); } catch (_) {}
+    setTimeout(() => process.exit(0), 300);
+  });
+}
+
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function parseMaybeJson(text) {
@@ -79,8 +125,12 @@ function readSession() {
   if (sessionOverride) return parseMaybeJson(sessionOverride);
 
   // 2) cookie saved by the dashboard (survives restarts if disk is persistent)
-  for (const file of ["appstate.json", "cookies.json"]) {
-    const filePath = path.join(process.cwd(), file);
+  const candidates = [
+    process.env.CELESTIAL_SESSION_FILE,
+    path.join(process.cwd(), "appstate.json"),
+    path.join(process.cwd(), "cookies.json")
+  ].filter(Boolean);
+  for (const filePath of candidates) {
     if (fs.existsSync(filePath)) return parseMaybeJson(fs.readFileSync(filePath, "utf8"));
   }
 
@@ -338,6 +388,8 @@ function onMessage(api, event) {
 
 function start(api, gen) {
   currentApi = api;
+  offlineSince = null;
+  probeFailures = 0;
   messengerConnected = true;
   loginError = null;
   lastConnectedAt = new Date().toISOString();
@@ -350,6 +402,12 @@ function start(api, gen) {
     if (error) {
       noteError("listener", error);
       console.error("[BANAT] listener error:", error);
+      const text = JSON.stringify(error?.message || error || "");
+      if (/not logged in|checkpoint|login approval|session.*(expired|invalid)|invalid.*session|authentication/i.test(text)) {
+        loginError = String(error?.message || error);
+        disconnectBot();
+        scheduleReconnect("session error");
+      }
       return;
     }
     try {
@@ -377,13 +435,44 @@ function start(api, gen) {
 // Stops the bot locally. Does NOT call api.logout(), so the Facebook cookie stays valid.
 function disconnectBot() {
   loginGen++;
+  clearTimeout(loginTimer);
+  loginTimer = null;
   try { if (stopListener) stopListener(); } catch (_) {}
   stopListener = null;
   currentApi = null;
   if (messengerConnected) lastDisconnectedAt = new Date().toISOString();
   messengerConnected = false;
   loginInProgress = false;
+  offlineSince = offlineSince || Date.now();
   console.log("[BANAT] disconnected");
+}
+
+function resetRetry() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnectAttempts = 0;
+  nextRetryAt = null;
+}
+
+// Auto-reconnect with exponential backoff: 5s, 10s, 20s ... up to 5 min.
+function scheduleReconnect(reason) {
+  if (manualStop || reconnectTimer) return;
+  if (reconnectAttempts >= MAX_RECONNECTS) {
+    pushEvent("watchdog", `Gave up after ${MAX_RECONNECTS} tries. Will retry in 30 min, or paste a fresh cookie.`);
+    return;
+  }
+  const delay = Math.min(300000, 5000 * 2 ** reconnectAttempts);
+  reconnectAttempts++;
+  nextRetryAt = new Date(Date.now() + delay).toISOString();
+  pushEvent("watchdog", `${reason} -> reconnect #${reconnectAttempts} in ${Math.round(delay / 1000)}s`);
+  console.log(`[BANAT] ${reason}; reconnect #${reconnectAttempts} in ${Math.round(delay / 1000)}s`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    nextRetryAt = null;
+    if (manualStop) return;
+    disconnectBot();
+    loginBot();
+  }, delay);
 }
 
 function loginBot() {
@@ -396,7 +485,7 @@ function loginBot() {
     loginInProgress = false;
     loginError = String(error?.message || error);
     console.error("[BANAT] no usable session:", loginError);
-    return;
+    return; // nothing to retry until a cookie is pasted
   }
 
   loginInProgress = true;
@@ -404,23 +493,103 @@ function loginBot() {
   console.log("[BANAT] logging in with saved Facebook session...");
   console.log(`[BANAT] session format: cookie string (${cookie.length} chars)`);
 
+  // If login hangs, give up on this attempt and retry.
+  clearTimeout(loginTimer);
+  loginTimer = setTimeout(() => {
+    if (gen !== loginGen || !loginInProgress) return;
+    loginGen++;
+    loginInProgress = false;
+    loginError = "login timed out";
+    noteError("login", "timed out");
+    scheduleReconnect("login timeout");
+  }, LOGIN_TIMEOUT_MS);
+
   try {
     login(cookie, (error, api) => {
       if (gen !== loginGen) return; // superseded by a newer login/disconnect
+      clearTimeout(loginTimer);
       loginInProgress = false;
       if (error) {
         messengerConnected = false;
         loginError = String(error?.message || error);
         noteError("login", error);
         console.error("[BANAT] login failed:", error);
+        scheduleReconnect("login failed");
         return;
       }
       start(api, gen);
     });
   } catch (error) {
+    clearTimeout(loginTimer);
     loginInProgress = false;
     loginError = String(error?.message || error);
     noteError("login", error);
+    scheduleReconnect("login error");
+  }
+}
+
+// Light "are you still logged in?" check every few minutes.
+function probe() {
+  if (!messengerConnected || !currentApi || manualStop) return;
+  const api = currentApi;
+  const gen = loginGen;
+  if (typeof api.getUserInfo !== "function" || !botUserID) return;
+
+  let done = false;
+  let timer = null;
+  const finish = (err) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    if (gen !== loginGen) return;
+    lastProbeAt = new Date().toISOString();
+    if (!err) {
+      probeFailures = 0;
+      lastProbeOk = true;
+      reconnectAttempts = 0;
+      return;
+    }
+    lastProbeOk = false;
+    probeFailures++;
+    noteError("watchdog probe", err);
+    if (probeFailures >= 3) {
+      probeFailures = 0;
+      pushEvent("watchdog", "Probe failed 3 times, restarting connection");
+      disconnectBot();
+      scheduleReconnect("probe failed");
+    }
+  };
+
+  timer = setTimeout(() => finish(new Error("probe timeout")), 30000);
+  try {
+    const r = api.getUserInfo(botUserID, (err) => finish(err || null));
+    if (r && typeof r.then === "function") r.then(() => finish(null)).catch(finish);
+  } catch (e) {
+    finish(e);
+  }
+}
+
+function hasSession() {
+  try { normalizeSession(readSession()); return true; } catch (_) { return false; }
+}
+
+// Memory guard + "stuck offline" guard, once a minute.
+function guard() {
+  const mb = process.memoryUsage().rss / 1048576;
+  if (mb > MEMORY_LIMIT_MB) {
+    console.error(`[BANAT] memory ${Math.round(mb)}MB > ${MEMORY_LIMIT_MB}MB, restarting`);
+    pushEvent("watchdog", `Memory ${Math.round(mb)}MB too high, restarting process`);
+    setTimeout(() => process.exit(1), 500); // Railway restarts it (see railway.json)
+    return;
+  }
+  if (
+    !messengerConnected && !loginInProgress && !manualStop && !reconnectTimer &&
+    reconnectAttempts >= MAX_RECONNECTS && offlineSince &&
+    Date.now() - offlineSince > RETRY_AFTER_GIVE_UP_MS && hasSession()
+  ) {
+    reconnectAttempts = 0;
+    offlineSince = Date.now();
+    scheduleReconnect("periodic retry");
   }
 }
 
@@ -455,6 +624,15 @@ try {
     default_on: DEFAULT_ON,
     global_send_limit: GLOBAL_SEND_LIMIT,
     thread_cooldown_ms: THREAD_COOLDOWN_MS,
+    auto_reconnect: !manualStop,
+    reconnect_attempts: reconnectAttempts,
+    next_retry_at: nextRetryAt,
+    watchdog_gave_up: reconnectAttempts >= MAX_RECONNECTS && !messengerConnected,
+    probe_failures: probeFailures,
+    last_probe_ok: lastProbeOk,
+    last_probe_at: lastProbeAt,
+    memory_mb: Math.round(process.memoryUsage().rss / 1048576),
+    memory_limit_mb: MEMORY_LIMIT_MB,
     updated_at: new Date().toISOString()
   }), {
     setPaused: (paused) => { botPaused = Boolean(paused); },
@@ -462,21 +640,30 @@ try {
     getEvents: () => events,
     connectSession: async (raw) => {
       sessionOverride = raw;
+      manualStop = false;
+      resetRetry();
       disconnectBot();
       loginBot();
     },
     reconnect: async () => {
+      manualStop = false;
+      resetRetry();
       disconnectBot();
       loginBot();
     },
     disconnect: async () => {
       sessionOverride = null;
+      manualStop = true;
+      resetRetry();
       disconnectBot();
     }
   });
 } catch (error) {
   console.error("[BANAT] dashboard API failed:", error);
 }
+
+setInterval(probe, PROBE_INTERVAL_MS).unref();
+setInterval(guard, 60000).unref();
 
 loginBot();
 
