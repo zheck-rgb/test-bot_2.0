@@ -241,7 +241,8 @@ module.exports = function startDashboardApi(port, getStatus, controls = {}) {
       if (isGet && p === "/api/dashboard/session") return send(res, 200, { ok: true, session });
       if (isGet && p === "/api/dashboard/events") {
         const extra = typeof controls.getEvents === "function" ? controls.getEvents() : [];
-        return send(res, 200, { ok: true, events: [...events, ...extra].slice(0, 80) });
+        const merged = [...events, ...extra].sort((a, b) => new Date(b.at) - new Date(a.at));
+        return send(res, 200, { ok: true, events: merged.slice(0, 80) });
       }
       if (isGet && p === "/api/dashboard/snapshot") return send(res, 200, { ok: true, snapshot: null, degraded: true });
       if (isGet && p === "/api/dashboard/analytics") {
