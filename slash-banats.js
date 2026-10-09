@@ -1,7 +1,7 @@
 "use strict";
 
 const ON_REPLIES = Object.freeze([
-  "hev abi owns you mga garapata",
+  "carti flyin owns you mga garapata",
   "andito na boss mo, behave kayo mga garapata",
   "sige, bukas na banat, sino unang tatamaan?",
   "ayan na, buhay na naman yung gulo",
